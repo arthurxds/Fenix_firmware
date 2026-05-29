@@ -1,0 +1,202 @@
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <RH_RF95.h> 
+#include <RHSoftwareSPI.h> 
+
+
+#define PIN_LORA_NSS      7   // Conectado em D7
+#define PIN_LORA_RST      9   // Conectado em D9
+#define PIN_LORA_DIO0     8   // Conectado em D8
+
+#define PIN_SPI_MISO     11   // MISO conectado em D11
+#define PIN_SPI_SCK      12   // SCK conectado em D12
+#define PIN_SPI_MOSI     13   // MOSI conectado em D13
+
+// Constantes de Tempo
+#define LORA_FREQ        915.0f
+#define LORA_TX_POWER    5
+#define NO_SIGNAL_WARN   5000   
+#define NO_SIGNAL_ALERT  30000  
+#define LORA_RETRY_MS    10000  
+
+// ─── INSTANCIAÇÃO DO SPI VIRTUAL E RÁDIO ─────────────────────
+RHSoftwareSPI spiVirtual;
+RH_RF95 lora(PIN_LORA_NSS, PIN_LORA_DIO0, spiVirtual);
+
+// Variáveis Globais
+unsigned long lastPacketMs = 0;
+unsigned long lastLoraRetry = 0;
+unsigned long loopCount = 0;
+
+bool loraReady = false;
+bool warnSent = false;
+bool alertActive = false;
+
+String lastEstado = "";
+
+// Protótipos
+void initLora();
+void processaPacket();
+void checaTimeout();
+void alertaEstado(const String& estado);
+void sendStatus(const char* codigo, const char* msg);
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(115200);
+    while (!Serial) { ; } 
+    
+    Serial.println(F("$STATUS,BOOT,Fenix UFMG Estacao de Solo v1.4"));
+    
+    // Configura os pinos do SPI por software conforme a imagem
+    spiVirtual.setPins(PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_SCK);
+    
+    initLora();
+    
+    sendStatus("READY", "Estacao configurada via SPI por Software. Aguardando pacotes...");
+    lastPacketMs = millis();
+    lastLoraRetry = millis();
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP PRINCIPAL
+// ─────────────────────────────────────────────────────────────
+void loop() {
+    unsigned long now = millis();
+
+    if (!loraReady) {
+        if (now - lastLoraRetry > LORA_RETRY_MS) {
+            lastLoraRetry = now;
+            sendStatus("LORA_RETRY", "Tentando reinicializar RFM95W...");
+            initLora();
+        }
+        loopCount++;
+        return; 
+    }
+
+    if (lora.available()) {
+        processaPacket();
+    }
+    
+    checaTimeout();
+    loopCount++;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  INICIALIZAÇÃO DO RÁDIO
+// ─────────────────────────────────────────────────────────────
+void initLora() {
+    pinMode(PIN_LORA_RST, OUTPUT);
+    digitalWrite(PIN_LORA_RST, LOW);
+    delay(10);
+    digitalWrite(PIN_LORA_RST, HIGH);
+    delay(10);
+
+    if (!lora.init()) {
+        sendStatus("LORA_ERR", "Falha no RFM95W. Verifique pinos D7, D8, D9, D11, D12, D13");
+        loraReady = false;
+        return; 
+    }
+
+    lora.setFrequency(LORA_FREQ);
+    lora.setTxPower(LORA_TX_POWER, false);
+    loraReady = true;
+    
+    Serial.print(F("$STATUS,LORA_OK,LoRa iniciado em "));
+    Serial.print(LORA_FREQ);
+    Serial.println(F(" MHz"));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  PROCESSAMENTO DOS PACOTES
+// ─────────────────────────────────────────────────────────────
+void processaPacket() {
+    uint8_t buf[RH_RF95_MAX_MESSAGE_LEN];
+    uint8_t len = sizeof(buf);
+
+    if (!lora.recv(buf, &len)) return;
+    
+    unsigned long ms_rx = millis();
+    lastPacketMs = ms_rx;
+    warnSent = false;
+    alertActive = false;
+
+    buf[len] = '\0'; 
+    String payload = String((char*)buf);
+    payload.trim();
+
+    int16_t rssi = lora.lastRssi();
+    float snr = lora.lastSNR();
+
+    // Envia a string no barramento serial USB para o script Python ler
+    Serial.print(F("$FENIX,"));
+    Serial.print(rssi);
+    Serial.print(F(","));
+    Serial.print(snr, 1);
+    Serial.print(F(","));
+    Serial.print(ms_rx);
+    Serial.print(F(","));
+    Serial.println(payload);
+
+    int firstComma = payload.indexOf(',');
+    if (firstComma >= 0) {
+        int secondComma = payload.indexOf(',', firstComma + 1);
+        if (secondComma >= 0) {
+            String estado = payload.substring(firstComma + 1, secondComma);
+            estado.trim();
+            alertaEstado(estado);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  TIMEOUT E ALERTAS (APENAS VIA PORTA SERIAL)
+// ─────────────────────────────────────────────────────────────
+void checaTimeout() {
+    unsigned long elapsed = millis() - lastPacketMs;
+
+    if (elapsed >= NO_SIGNAL_ALERT) {
+        if (!alertActive) {
+            sendStatus("NO_SIGNAL_CRITICAL", "Sem sinal por 30s!");
+            alertActive = true;
+        }
+        return;
+    }
+
+    if (elapsed >= NO_SIGNAL_WARN && !warnSent) {
+        sendStatus("NO_SIGNAL_WARN", "Sem pacote ha 5s");
+        warnSent = true;
+    }
+}
+
+void alertaEstado(const String& estado) {
+    if (estado == lastEstado) return; 
+
+    if (estado == "VOANDO") {
+        sendStatus("EVENT_LAUNCH", "Lancamento detectado"); 
+    } 
+    else if (estado == "APOGEU") {
+        sendStatus("EVENT_APOGEU", "Apogeu detectado"); 
+    } 
+    else if (estado == "DESCIDA_DROGUE") { 
+        sendStatus("EVENT_DROGUE", "Drogue disparado"); 
+    } 
+    else if (estado == "DESCIDA_MAIN") {
+        sendStatus("EVENT_MAIN", "Main disparado"); 
+    } 
+    else if (estado == "SOLO") {
+        sendStatus("EVENT_SOLO", "Foguete pousado"); 
+    }
+
+    lastEstado = estado;
+}
+
+void sendStatus(const char* codigo, const char* msg) {
+    Serial.print(F("$STATUS,"));
+    Serial.print(codigo);
+    Serial.print(F(","));
+    Serial.println(msg);
+}

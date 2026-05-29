@@ -1,0 +1,343 @@
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <HardwareSerial.h>
+#include <RH_RF95.h>
+#include <TinyGPSPlus.h>
+#include <MS5611.h>
+#include <Adafruit_ADXL375.h>
+
+// ─── PINOS ──────────────────────────────────────────────────
+#define PIN_SDA           21
+#define PIN_SCL           22
+#define PIN_SPI_MISO      19
+#define PIN_SPI_MOSI      23
+#define PIN_SPI_SCK       18
+#define PIN_LORA_NSS       5
+#define PIN_LORA_RST      32
+#define PIN_LORA_DIO0     33
+#define PIN_SD_CS         15
+#define PIN_GPS_RX        16
+#define PIN_GPS_TX        17
+#define PIN_BUZZER        4
+#define PIN_SQUIB_DROGUE  26  
+#define PIN_SQUIB_MAIN    27  
+#define PIN_RBF           34
+
+#define LOOP_MS           20      
+#define TELEMETRY_MS     500     
+#define SD_SYNC_MS      1000      
+
+#define LAUNCH_ALT_M      10.0f  
+#define LAUNCH_CONFIRM     3      
+#define APOGEE_CONFIRM     3      
+#define MAIN_ALT_M       450.0f  
+#define LANDING_SPEED     0.5f    
+#define LANDING_TIME_MS  3000    
+#define SQUIB_PULSE_MS    500    
+
+// ─── MÁQUINA DE ESTADOS 
+enum FlightState : uint8_t {
+    IDLE           = 0,
+    VOANDO         = 1,
+    APOGEU         = 2,
+    DESCIDA_DROGUE = 3,   
+    DESCIDA_MAIN   = 4,   
+    SOLO           = 5
+};
+
+const char* ESTADOS[] = {
+    "IDLE", "VOANDO", "APOGEU", "DESCIDA_DROGUE", "DESCIDA_MAIN", "SOLO"
+};
+
+// ─── VARIÁVEIS GLOBAIS 
+FlightState currentState = IDLE;
+
+float padPressure = 101325.0f, pressure = 0.0f, temp = 0.0f;
+float altAGL = 0.0f, altPrev = 0.0f, vz = 0.0f, maxAlt = 0.0f;
+float ax = 0.0f, ay = 0.0f, az = 0.0f;
+
+double gpsLat = 0.0, gpsLon = 0.0;
+float gpsAlt = 0.0f;
+uint8_t gpsSats = 0;
+bool gpsValid = false, ms5611_ok = false, adxl_ok = false, lora_ok = false, sd_ok = false, rbfRemoved = false;
+
+bool squibDrogueFired = false, squibMainFired = false;
+bool droguePinActive = false, mainPinActive = false;
+
+int launchCount = 0, apogeeCount = 0;
+unsigned long apogeeTimer = 0, landingTimer = 0, lastLoop = 0, lastTele = 0, lastSync = 0;
+unsigned long squibDrogueTimer = 0, squibMainTimer = 0;
+
+// ─── OBJETOS 
+MS5611 baro;
+Adafruit_ADXL375 accel(0x53);
+RH_RF95 lora(PIN_LORA_NSS, PIN_LORA_DIO0);
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+File logFile;
+
+// ─── PROTÓTIPOS 
+void readSensors();
+void updateFSM();
+void processData();
+void controlSquibs();
+void checkRBF();
+void buzzerBeep(int n, int onMs, int offMs = 150);
+
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
+void setup() {
+    Serial.begin(115200);
+    Serial.println(F("\n=== FENIX UFMG v2.1 — DUAL EVENT ==="));
+
+    pinMode(PIN_BUZZER,        OUTPUT);
+    pinMode(PIN_SQUIB_DROGUE, OUTPUT);
+    pinMode(PIN_SQUIB_MAIN,    OUTPUT);
+    pinMode(PIN_RBF,          INPUT);
+
+    digitalWrite(PIN_BUZZER,        LOW);
+    digitalWrite(PIN_SQUIB_DROGUE, LOW);   
+    digitalWrite(PIN_SQUIB_MAIN,    LOW);   
+
+    checkRBF();
+
+    Wire.begin(PIN_SDA, PIN_SCL);
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+    gpsSerial.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+
+    if (SD.begin(PIN_SD_CS)) {
+        logFile = SD.open("/fenix_log.csv", FILE_WRITE);
+        if (logFile) {
+            logFile.println(F("ms,estado,alt,vz,pressao,temp,ax,ay,az,lat,lon,sats,rbf,squib_drogue,squib_main"));
+            logFile.flush();
+            sd_ok = true;
+            Serial.println(F("[OK] SD card"));
+        }
+    } else { Serial.println(F("[ERRO] SD card")); }
+
+    if (baro.begin()) {
+        baro.setOversampling(OSR_ULTRA_HIGH);
+        ms5611_ok = true;
+        Serial.println(F("[OK] MS5611"));
+    } else { Serial.println(F("[ERRO] MS5611")); }
+
+    if (accel.begin()) {
+        accel.setDataRate(ADXL343_DATARATE_100_HZ);
+        adxl_ok = true;
+        Serial.println(F("[OK] ADXL375"));
+    } else { Serial.println(F("[ERRO] ADXL375")); }
+
+    pinMode(PIN_LORA_RST, OUTPUT);
+    digitalWrite(PIN_LORA_RST, LOW);  delay(10);
+    digitalWrite(PIN_LORA_RST, HIGH); delay(10);
+    if (lora.init()) {
+        lora.setFrequency(915.0);
+        lora.setTxPower(20, false);
+        lora_ok = true;
+        Serial.println(F("[OK] LoRa RFM95W"));
+    } else { Serial.println(F("[ERRO] LoRa RFM95W")); }
+
+    Serial.println(F("[IDLE] Calibrando pad..."));
+    if (ms5611_ok) {
+        float soma = 0.0f;
+        int n = 0;
+        for (int i = 0; i < 30; i++) {
+            if (baro.read() == 0) { soma += baro.getPressure(); n++; }
+            delay(20);
+        }
+        if (n > 0) padPressure = soma / n;
+    }
+    Serial.printf("[IDLE] Pad calibrado: %.2f Pa\n", padPressure);
+    Serial.println(F("[IDLE] Ready!\n"));
+
+    buzzerBeep(2, 300);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LOOP PRINCIPAL — 50 Hz
+// ─────────────────────────────────────────────────────────────
+void loop() {
+    unsigned long now = millis();
+    if (now - lastLoop < LOOP_MS) return;
+    lastLoop = now;
+
+    while (gpsSerial.available()) gps.encode(gpsSerial.read());
+    if (gps.location.isValid()) {
+        gpsLat  = gps.location.lat();
+        gpsLon  = gps.location.lng();
+        gpsAlt  = gps.altitude.meters();
+        gpsSats = gps.satellites.value();
+        gpsValid = true;
+    }
+
+    readSensors();
+    updateFSM();
+    controlSquibs(); // Desliga os pinos dos squibs após 500ms sem travar o loop
+    processData();
+}
+
+void readSensors() {
+    checkRBF();
+
+    if (ms5611_ok && baro.read() == 0) {
+        pressure = baro.getPressure();
+        temp     = baro.getTemperature();
+        altPrev  = altAGL;
+        altAGL   = 44330.0f * (1.0f - powf(pressure / padPressure, 0.1903f));
+        vz       = (altAGL - altPrev) / (LOOP_MS / 1000.0f);
+        if (altAGL > maxAlt) maxAlt = altAGL;
+    }
+
+    if (adxl_ok) {
+        sensors_event_t event;
+        accel.getEvent(&event);
+        ax = event.acceleration.x / 9.81f;
+        ay = event.acceleration.y / 9.81f;
+        az = event.acceleration.z / 9.81f;
+    }
+}
+
+void updateFSM() {
+    switch (currentState) {
+
+        case IDLE:
+            if (altAGL > LAUNCH_ALT_M) launchCount++;
+            else                       launchCount = 0;
+
+            if (launchCount >= LAUNCH_CONFIRM) {
+                currentState = VOANDO;
+                launchCount  = 0;
+                Serial.println(F("[FSM] LANCAMENTO!"));
+                buzzerBeep(1, 200);
+            }
+            break;
+
+        case VOANDO:
+            if (vz < 0.0f) apogeeCount++;
+            else            apogeeCount = 0;
+
+            if (apogeeCount >= APOGEE_CONFIRM) {
+                currentState = APOGEU;
+                apogeeTimer  = millis();
+                apogeeCount  = 0;
+                Serial.printf(F("[FSM] APOGEU! Alt: %.1fm\n"), maxAlt);
+                buzzerBeep(2, 200);
+            }
+            break;
+
+        case APOGEU:
+            if (millis() - apogeeTimer >= 1000) {
+                if (rbfRemoved && altAGL >= 50.0f && !squibDrogueFired) {
+                    digitalWrite(PIN_SQUIB_DROGUE, HIGH);
+                    droguePinActive = true;
+                    squibDrogueTimer = millis();
+                    squibDrogueFired = true;
+                    Serial.println(F("[SQUIB] Drogue Ativado"));
+                }
+                currentState = DESCIDA_DROGUE;
+            }
+            break;
+
+        case DESCIDA_DROGUE:
+            if (altAGL <= MAIN_ALT_M) {
+                if (rbfRemoved && !squibMainFired) {
+                    digitalWrite(PIN_SQUIB_MAIN, HIGH);
+                    mainPinActive = true;
+                    squibMainTimer = millis();
+                    squibMainFired = true;
+                    Serial.println(F("[SQUIB] Main Ativado"));
+                }
+                currentState = DESCIDA_MAIN;
+                buzzerBeep(1, 300);
+            }
+            break;
+
+        case DESCIDA_MAIN:
+            if (fabsf(vz) < LANDING_SPEED) {
+                if (landingTimer == 0) landingTimer = millis();
+                if (millis() - landingTimer >= LANDING_TIME_MS) {
+                    currentState = SOLO;
+                    Serial.println(F("[FSM] POUSADO!"));
+                    buzzerBeep(3, 300);
+                }
+            } else {
+                landingTimer = 0;
+            }
+            break;
+
+        case SOLO:
+            if (millis() % 3000 < LOOP_MS) {
+                buzzerBeep(3, 100, 100);
+            }
+            break;
+    }
+}
+
+void controlSquibs() {
+    unsigned long now = millis();
+    
+    // Desliga pino do drogue após 500ms
+    if (droguePinActive && (now - squibDrogueTimer >= SQUIB_PULSE_MS)) {
+        digitalWrite(PIN_SQUIB_DROGUE, LOW);
+        droguePinActive = false;
+        Serial.println(F("[SQUIB] Pulso Drogue Finalizado"));
+    }
+    
+    // Desliga pino do main após 500ms
+    if (mainPinActive && (now - squibMainTimer >= SQUIB_PULSE_MS)) {
+        digitalWrite(PIN_SQUIB_MAIN, LOW);
+        mainPinActive = false;
+        Serial.println(F("[SQUIB] Pulso Main Finalizado"));
+    }
+}
+
+void checkRBF() {
+    rbfRemoved = (digitalRead(PIN_RBF) == HIGH);
+}
+
+void processData() {
+    unsigned long now = millis();
+
+    String csv = String(now)                    + "," +
+                 String(ESTADOS[currentState])  + "," +
+                 String(altAGL,  1)             + "," +
+                 String(vz,  1)                 + "," +
+                 String(pressure,0)             + "," +
+                 String(temp,  1)               + "," +
+                 String(ax,  2)                 + "," +
+                 String(ay,  2)                 + "," +
+                 String(az,  2)                 + "," +
+                 String(gpsLat,  6)             + "," +
+                 String(gpsLon,  6)             + "," +
+                 String(gpsSats)                + "," +
+                 String(rbfRemoved    ? 1 : 0)  + "," +
+                 String(squibDrogueFired ? 1 : 0) + "," +
+                 String(squibMainFired  ? 1 : 0);
+
+    if (sd_ok) {
+        logFile.println(csv);
+        if (now - lastSync >= SD_SYNC_MS) {
+            logFile.flush();
+            lastSync = now;
+        }
+    }
+
+    if (lora_ok && (now - lastTele >= TELEMETRY_MS)) {
+        lora.send((uint8_t*)csv.c_str(), csv.length());
+        lora.waitPacketSent();
+        lastTele = now;
+    }
+}
+
+void buzzerBeep(int n, int onMs, int offMs) {
+    for (int i = 0; i < n; i++) {
+        digitalWrite(PIN_BUZZER, HIGH); delay(onMs);
+        digitalWrite(PIN_BUZZER, LOW);
+        if (i < n - 1) delay(offMs);
+    }
+}
