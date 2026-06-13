@@ -1,4 +1,4 @@
-# Fênix UFMG - Sistema de Aviônica e Telemetria (v4.0)
+# Fênix UFMG - Sistema de Aviônica e Telemetria 
 
 Este repositório reúne o firmware do sistema eletrônico de controle, aquisição de dados e telemetria, desenvolvido para os projetos de foguetimodelismo de alta potência da equipe Fênix UFMG. O projeto é composto por dois módulos principais que operam em conjunto via comunicação de radiofrequência (LoRa).
 
