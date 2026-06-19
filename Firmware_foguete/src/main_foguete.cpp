@@ -114,9 +114,6 @@ void setup() {
     checkRBF();
 
     Wire.begin(PIN_SDA, PIN_SCL);
-    // Acelera o barramento I2C para 400kHz (Fast Mode) para ler 4 sensores sem atrasos
-    Wire.setClock(400000);
-
     SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
     gpsSerial.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
 
@@ -143,7 +140,7 @@ void setup() {
         Serial.println(F("[OK] BMP280 (0x76)"));
     } else { Serial.println(F("[ERRO] BMP280")); }
 
-    // Sensores de Aceleração (Passando o endereço I2C aqui no begin)
+    // Sensores de Aceleração 
     if (accel1.begin(0x53)) { 
         accel1.setDataRate(ADXL343_DATARATE_100_HZ);
         adxl1_ok = true;
@@ -211,7 +208,7 @@ void loop() {
 // ─────────────────────────────────────────────────────────────
 //  LEITURA DOS SENSORES
 // ─────────────────────────────────────────────────────────────
-void void readSensors() {
+void readSensors() {
     checkRBF();
 
     // Lê o Barômetro Mestre (O FSM usa este para tomar decisões)
@@ -269,10 +266,8 @@ void updateFSM() {
             break;
 
         case VOANDO:
-            // Condição 1: Velocidade vertical negativa.
-            // Condição 2 (Failsafe): Altitude caiu 15 metros em relação ao máximo registado.
-            if (vz < 0.0f || (maxAlt - ms_alt) > 15.0f) apogeeCount++;
-            else                                        apogeeCount = 0;
+            if (vz < 0.0f) apogeeCount++;
+            else           apogeeCount = 0;
 
             if (apogeeCount >= APOGEE_CONFIRM) {
                 currentState = APOGEU;
@@ -284,15 +279,14 @@ void updateFSM() {
             break;
 
         case APOGEU:
-            // Atraso de 2000 ms (2 segundos) após o apogeu ser detetado.
-            // Dá tempo para o sistema primário (StratoLogger) atuar primeiro.
+            // Atraso de 2 segundos (2000 ms) para atuar como Backup
             if (millis() - apogeeTimer >= 2000) {
                 if (rbfRemoved && ms_alt >= 50.0f && !squibFired) {
                     digitalWrite(PIN_SQUIB, HIGH);
                     squibPinActive = true;
                     squibTimer     = millis();
                     squibFired     = true;
-                    Serial.println(F("[SQUIB] Paraquedas Ativado (BACKUP ESP32)!"));
+                    Serial.println(F("[SQUIB] Paraquedas Ativado (Backup ESP)!"));
                 }
                 currentState = DESCIDA;
                 Serial.println(F("[FSM] APOGEU -> DESCIDA"));
@@ -357,7 +351,6 @@ void processData() {
 
     if (sd_ok) {
         logFile.println(csv);
-        // Garante que os dados são salvos no cartão SD periodicamente
         if (now - lastSync >= SD_SYNC_MS) {
             logFile.flush();
             lastSync = now;
